@@ -8,10 +8,12 @@ from dash.dependencies import Input, Output
 import dash_bootstrap_components as dbc
 import plotly.express as px
 import plotly.graph_objects as go
+import statsmodels.api as sm
+from statsmodels.nonparametric.smoothers_lowess import lowess
 
 # DATA LOADING AND PREPARATION
 BASE = Path(__file__).resolve().parent
-CSV_PATH = BASE / "dataset" / "pwt110_cleaned.csv"
+CSV_PATH = BASE / "dataset" / "pwt110_imputed.csv"
 
 if not CSV_PATH.exists():
     raise FileNotFoundError(f"Dataset not found at {CSV_PATH}. Make sure the `dataset/` folder is present.")
@@ -39,6 +41,58 @@ if 'gdp_pc_growth' not in df.columns:
 df['gdp_pc'] = pd.to_numeric(df['gdp_pc'], errors='coerce')
 if 'gdp_pc_growth' in df.columns:
     df['gdp_pc_growth'] = pd.to_numeric(df['gdp_pc_growth'], errors='coerce')
+
+# PRECOMPUTE CAPITAL ANALYSIS COLUMNS
+# K/L (capital per worker), K/Y (capital-output ratio)
+if 'rnna' in df.columns and 'emp' in df.columns:
+    df['kl'] = df['rnna'] / df['emp']
+if 'rnna' in df.columns and 'rgdpo' in df.columns:
+    df['ky'] = df['rnna'] / df['rgdpo']
+
+# Log10 transformations for capital analysis
+for col in ['rgdpo', 'rnna', 'kl', 'ky']:
+    if col in df.columns:
+        df[f'log10_{col}'] = np.log10(df[col].replace(0, np.nan))
+
+# PRECOMPUTE LABOUR ANALYSIS COLUMNS
+# Labour productivity (output per worker)
+if 'rgdpo' in df.columns and 'emp' in df.columns:
+    df['labprod'] = df['rgdpo'] / df['emp']
+
+# Log10 transformations for labour analysis
+if 'rgdpo' in df.columns:
+    df['log10_rgdpo'] = np.log10(df['rgdpo'].replace(0, np.nan))
+if 'emp' in df.columns:
+    df['log10_emp'] = np.log10(df['emp'].replace(0, np.nan))
+if 'hc' in df.columns:
+    df['log10_hc'] = np.log10(df['hc'].replace(0, np.nan))
+if 'labsh' in df.columns:
+    df['log10_labsh'] = np.log10(df['labsh'].clip(lower=1e-6).replace(0, np.nan))
+if 'labprod' in df.columns:
+    df['log10_labprod'] = np.log10(df['labprod'].replace(0, np.nan))
+
+# PRECOMPUTE PRODUCTIVITY ANALYSIS COLUMNS
+# Productivity measures
+if 'rgdpo' in df.columns and 'rnna' in df.columns:
+    df['capprod'] = df['rgdpo'] / df['rnna']  # capital productivity
+if 'rtfpna' in df.columns:
+    df['tfp'] = df['rtfpna']  # total factor productivity
+
+# Log10 transformations for productivity analysis
+for col in ['capprod', 'tfp']:
+    if col in df.columns:
+        df[f'log10_{col}'] = np.log10(df[col].clip(lower=1e-8))
+
+# Growth rates for decomposition
+df = df.sort_values(['countrycode', 'year'])
+if 'rgdpo' in df.columns:
+    df['gdp_growth'] = df.groupby('countrycode')['rgdpo'].pct_change() * 100
+if 'tfp' in df.columns:
+    df['tfp_growth'] = df.groupby('countrycode')['tfp'].pct_change() * 100
+if 'labprod' in df.columns:
+    df['labprod_growth'] = df.groupby('countrycode')['labprod'].pct_change() * 100
+if 'capprod' in df.columns:
+    df['capprod_growth'] = df.groupby('countrycode')['capprod'].pct_change() * 100
 
 YEARS = sorted(int(y) for y in df['year'].unique())
 MIN_YEAR, MAX_YEAR = min(YEARS), max(YEARS)
@@ -155,151 +209,1594 @@ COLORS = px.colors.qualitative.Bold
 
 # DASHBOARD LAYOUT
 app.layout = dbc.Container([
-    dbc.Row(dbc.Col(html.H2("PWT 11.0 | Exploratory Data Analysis", className='app-header'))),
+    # Header
     dbc.Row([
-    dbc.Col([
-            html.Div([
-                html.Label("Countries"),
-                dcc.Dropdown(
-                    id='country-dropdown',
-                    options=[{'label': c, 'value': c} for c in COUNTRIES],
-                    value=default_countries,
-                    multi=True,
-                    placeholder='Select countries...'
-                ),
-                html.Br(),
-                html.Label("Year range"),
-                dcc.RangeSlider(
-                    id='year-slider',
-                    min=MIN_YEAR,
-                    max=MAX_YEAR,
-                    value=[MIN_YEAR, MAX_YEAR],
-                    marks={y: str(y) for y in range(MIN_YEAR, MAX_YEAR+1, max(1, (MAX_YEAR-MIN_YEAR)//8))},
-                    step=1
-                ),
-                html.Br(),
-                html.Label('Primary indicator/dependent variable'),
-                dcc.Dropdown(
-                    id='primary-indicator',
-                    options=[{'label': v, 'value': k} for k, v in AVAILABLE_INDICATORS.items()],
-                    value='gdp_pc' if 'gdp_pc' in AVAILABLE_INDICATORS else list(AVAILABLE_INDICATORS.keys())[0],
-                    clearable=False
-                ),
-                html.Div(id='primary-indicator-desc', style={'fontSize': '0.85rem', 'color': '#444', 'marginTop': '6px', 'marginBottom': '8px'}),
-                html.Br(),
-                html.Label('Comparison indicator/independent variable'),
-                dcc.Dropdown(
-                    id='comparison-indicator',
-                    options=[{'label': v, 'value': k} for k, v in AVAILABLE_INDICATORS.items()],
-                    value='pop' if 'pop' in AVAILABLE_INDICATORS else list(AVAILABLE_INDICATORS.keys())[1] if len(AVAILABLE_INDICATORS) > 1 else None,
-                    clearable=False
-                ),
-                html.Div(id='comparison-indicator-desc', style={'fontSize': '0.85rem', 'color': '#444', 'marginTop': '6px', 'marginBottom': '8px'}),
-                html.Br(),
-                dbc.Checklist(
-                    id='log-scale',
-                    options=[{'label': 'Use log scale for time series', 'value': 'log'}],
-                    value=[],
-                    switch=True
-                ),
-                html.Hr(),
-                html.Label('Scatter plot settings', style={'fontWeight': '600', 'fontSize': '0.95rem'}),
-                html.Br(),
-                dbc.Checklist(
-                    id='scatter-log-x',
-                    options=[{'label': 'Log scale X-axis', 'value': 'log'}],
-                    value=[],
-                    switch=True
-                ),
-                dbc.Checklist(
-                    id='scatter-log-y',
-                    options=[{'label': 'Log scale Y-axis', 'value': 'log'}],
-                    value=[],
-                    switch=True
-                ),
-                html.Br(),
-                dbc.Checklist(
-                    id='scatter-show-labels',
-                    options=[{'label': 'Show country labels', 'value': 'show'}],
-                    value=['show'],
-                    switch=True
-                ),
-                html.Hr(),
-                html.Label('Distribution chart settings', style={'fontWeight': '600', 'fontSize': '0.95rem'}),
-                html.Br(),
-                dbc.Checklist(
-                    id='dist-log-scale',
-                    options=[{'label': 'Log scale', 'value': 'log'}],
-                    value=[],
-                    switch=True
-                ),
-                html.Hr(),
-                dbc.Card([dbc.CardBody([
-                    html.H6("Summary Statistics", className='card-title'),
-                    html.Div(id='summary-stats', style={'fontSize': '0.85rem'})
-                ])], style={'marginBottom': '12px'}),
-                html.Br(),
-                html.Div(id='map-selected-info', style={'fontSize': '0.9rem', 'color': '#222', 'padding': '8px', 'backgroundColor': '#f0f0f0', 'borderRadius': '4px'}),
-            ], className='sidebar')
-    ], width=2),
+        dbc.Col([
+            html.H2("PWT 11.0 | Exploratory Data Analysis", className='text-center mb-2')
+        ])
+    ]),
 
-    dbc.Col([
-            dbc.Row([
-                dbc.Col(html.Div(dcc.Graph(id='gdp-world-map', config={'displayModeBar': False}, style={'height': '520px'}), className='dash-graph'), width=6),
-                dbc.Col(html.Div(dcc.Graph(id='gdp-timeseries', config={'displayModeBar': False}, style={'height': '520px'}), className='dash-graph'), width=6),
-            ], className='chart-row g-2'),
+    # Tabs
+    dbc.Row([
+        dbc.Col([
+            dbc.Tabs([
+                dbc.Tab(label="GDP", tab_id="tab-gdp", children=[
+                    html.Div([
+                        html.H4("GDP Analysis", style={'marginTop': '10px', 'marginBottom': '15px'}),
 
-            dbc.Row([
-                dbc.Col(html.Div(dcc.Graph(id='gdp-growth', config={'displayModeBar': False}, style={'height': '400px'}), className='dash-graph'), width=6),
-                dbc.Col(html.Div(dcc.Graph(id='gdp-rel-world', config={'displayModeBar': False}, style={'height': '400px'}), className='dash-graph'), width=6)
-            ], className='chart-row g-2'),
+                        # Controls
+                        dbc.Row([
+                            dbc.Col([
+                                html.Label("Select Countries", style={'fontWeight': '600', 'marginBottom': '5px'}),
+                                dcc.Dropdown(
+                                    id='gdp-country-dropdown',
+                                    options=[{'label': c, 'value': c} for c in COUNTRIES],
+                                    value=default_countries,
+                                    multi=True,
+                                    placeholder='Select countries...'
+                                ),
+                            ], width=6),
+                            dbc.Col([
+                                html.Label("Select Year", style={'fontWeight': '600', 'marginBottom': '5px'}),
+                                dcc.Slider(
+                                    id='gdp-year-slider',
+                                    min=MIN_YEAR,
+                                    max=MAX_YEAR,
+                                    value=MAX_YEAR,
+                                    marks={y: str(y) for y in range(MIN_YEAR, MAX_YEAR+1, 10)},
+                                    step=1,
+                                    tooltip={"placement": "bottom", "always_visible": True}
+                                ),
+                            ], width=6)
+                        ], style={'marginBottom': '20px'}),
 
-            dbc.Row([
-                dbc.Col(html.Div(dcc.Graph(id='scatter-latest', config={'displayModeBar': False}, style={'height': '400px'}), className='dash-graph'), width=6),
-                dbc.Col(html.Div(dcc.Graph(id='residual-plot', config={'displayModeBar': False}, style={'height': '400px'}), className='dash-graph'), width=6)
-            ], className='chart-row g-2'),
+                        # Visualizations Grid
+                        dbc.Row([
+                            dbc.Col([
+                                dcc.Graph(id='gdp-world-map', config={'displayModeBar': False},
+                                         style={'height': '360px'})
+                            ], width=6),
+                            dbc.Col([
+                                dcc.Graph(id='gdp-distribution', config={'displayModeBar': False},
+                                         style={'height': '360px'})
+                            ], width=6)
+                        ], className='mb-2'),
 
-            dbc.Row([
-                dbc.Col(html.Div(dcc.Graph(id='distribution-chart', config={'displayModeBar': False}, style={'height': '350px'}), className='dash-graph'), width=6),
-                dbc.Col(html.Div(dcc.Graph(id='qq-plot', config={'displayModeBar': False}, style={'height': '350px'}), className='dash-graph'), width=6)
-            ], className='chart-row g-2'),
+                        dbc.Row([
+                            dbc.Col([
+                                dcc.Graph(id='gdp-scatter-log', config={'displayModeBar': False},
+                                         style={'height': '360px'})
+                            ], width=6),
+                            dbc.Col([
+                                dcc.Graph(id='gdp-timeseries', config={'displayModeBar': False},
+                                         style={'height': '360px'})
+                            ], width=6)
+                        ])
+                    ], style={'padding': '10px'})
+                ]),
+                dbc.Tab(label="Capital", tab_id="tab-capital", children=[
+                    html.Div([
+                        html.H4("Capital Analysis", style={'marginTop': '10px', 'marginBottom': '15px'}),
 
-            dbc.Row([
-                # missing-data-heatmap removed
-            ], className='chart-row g-2'),
+                        # Controls
+                        dbc.Row([
+                            dbc.Col([
+                                html.Label("Select Year", style={'fontWeight': '600', 'marginBottom': '5px'}),
+                                dcc.Slider(
+                                    id='capital-year-slider',
+                                    min=MIN_YEAR,
+                                    max=MAX_YEAR,
+                                    value=MAX_YEAR,
+                                    marks={y: str(y) for y in range(MIN_YEAR, MAX_YEAR+1, 10)},
+                                    step=1,
+                                    tooltip={"placement": "bottom", "always_visible": True}
+                                ),
+                            ], width=6),
+                            dbc.Col([
+                                html.Label("Select Countries (for time series)", style={'fontWeight': '600', 'marginBottom': '5px'}),
+                                dcc.Dropdown(
+                                    id='capital-country-dropdown',
+                                    options=[{'label': c, 'value': c} for c in COUNTRIES],
+                                    value=['United States', 'China', 'India', 'Germany', 'Japan'] if all(c in COUNTRIES for c in ['United States', 'China', 'India', 'Germany', 'Japan']) else default_countries,
+                                    multi=True,
+                                    placeholder='Select countries...'
+                                ),
+                            ], width=6)
+                        ], style={'marginBottom': '20px'}),
 
-            dbc.Row([
-                dbc.Col([
-                    html.H5("Data Table | Filtered View", style={'marginTop': '8px', 'marginBottom': '8px'}),
-                    html.Div(id='data-table-container')
-                ], width=12)
-            ], className='chart-row g-2'),
+                        # Visualizations Grid
+                        dbc.Row([
+                            dbc.Col([
+                                dcc.Graph(id='capital-gdp-scatter', config={'displayModeBar': False},
+                                         style={'height': '360px'})
+                            ], width=6),
+                            dbc.Col([
+                                dcc.Graph(id='capital-kl-ky-timeseries', config={'displayModeBar': False},
+                                         style={'height': '360px'})
+                            ], width=6)
+                        ], className='mb-2'),
 
-        ], width=10)
+                        dbc.Row([
+                            dbc.Col([
+                                dcc.Graph(id='capital-linearity-diagnostic', config={'displayModeBar': False},
+                                         style={'height': '360px'})
+                            ], width=6),
+                            dbc.Col([
+                                dcc.Graph(id='capital-residuals-plot', config={'displayModeBar': False},
+                                         style={'height': '360px'})
+                            ], width=6)
+                        ])
+                    ], style={'padding': '10px'})
+                ]),
+                dbc.Tab(label="Labour", tab_id="tab-labour", children=[
+                    html.Div([
+                        html.H4("Labour Analysis", style={'marginTop': '10px', 'marginBottom': '15px'}),
+
+                        # Controls
+                        dbc.Row([
+                            dbc.Col([
+                                html.Label("Select Labour Indicator", style={'fontWeight': '600', 'marginBottom': '5px'}),
+                                dcc.Dropdown(
+                                    id='labour-indicator-dropdown',
+                                    options=[
+                                        {'label': 'Employment', 'value': 'emp'},
+                                        {'label': 'Human Capital', 'value': 'hc'},
+                                        {'label': 'Labour Share', 'value': 'labsh'},
+                                        {'label': 'Labour Productivity', 'value': 'labprod'}
+                                    ],
+                                    value='emp',
+                                    clearable=False
+                                ),
+                            ], width=4),
+                            dbc.Col([
+                                html.Label("Select Year", style={'fontWeight': '600', 'marginBottom': '5px'}),
+                                dcc.Slider(
+                                    id='labour-year-slider',
+                                    min=MIN_YEAR,
+                                    max=MAX_YEAR,
+                                    value=MAX_YEAR,
+                                    marks={y: str(y) for y in range(MIN_YEAR, MAX_YEAR+1, 10)},
+                                    step=1,
+                                    tooltip={"placement": "bottom", "always_visible": True}
+                                ),
+                            ], width=4),
+                            dbc.Col([
+                                html.Label("Select Countries (for time series)", style={'fontWeight': '600', 'marginBottom': '5px'}),
+                                dcc.Dropdown(
+                                    id='labour-country-dropdown',
+                                    options=[{'label': c, 'value': c} for c in COUNTRIES],
+                                    value=['United States', 'China', 'India', 'Germany', 'Japan'] if all(c in COUNTRIES for c in ['United States', 'China', 'India', 'Germany', 'Japan']) else default_countries,
+                                    multi=True,
+                                    placeholder='Select countries...'
+                                ),
+                            ], width=4)
+                        ], style={'marginBottom': '20px'}),
+
+                        # Visualizations Grid (reordered to match Capital layout)
+                        dbc.Row([
+                            dbc.Col([
+                                dcc.Graph(id='labour-gdp-scatter', config={'displayModeBar': False},
+                                         style={'height': '360px'})
+                            ], width=6),
+                            dbc.Col([
+                                dcc.Graph(id='labour-timeseries', config={'displayModeBar': False},
+                                         style={'height': '360px'})
+                            ], width=6)
+                        ], className='mb-2'),
+
+                        dbc.Row([
+                            dbc.Col([
+                                dcc.Graph(id='labour-linearity-diagnostic', config={'displayModeBar': False},
+                                         style={'height': '360px'})
+                            ], width=6),
+                            dbc.Col([
+                                dcc.Graph(id='labour-residuals-plot', config={'displayModeBar': False},
+                                         style={'height': '360px'})
+                            ], width=6)
+                        ])
+                    ], style={'padding': '10px'})
+                ]),
+                dbc.Tab(label="Productivity", tab_id="tab-productivity", children=[
+                    html.Div([
+                        html.H4("Productivity Analysis", style={'marginTop': '10px', 'marginBottom': '15px'}),
+
+                        # Controls
+                        dbc.Row([
+                            dbc.Col([
+                                html.Label("Select Productivity Measure", style={'fontWeight': '600', 'marginBottom': '5px'}),
+                                dcc.Dropdown(
+                                    id='productivity-indicator-dropdown',
+                                    options=[
+                                        {'label': 'Labour Productivity (GDP per worker)', 'value': 'labprod'},
+                                        {'label': 'Capital Productivity (GDP per unit capital)', 'value': 'capprod'},
+                                        {'label': 'Total Factor Productivity', 'value': 'tfp'}
+                                    ],
+                                    value='labprod',
+                                    clearable=False
+                                ),
+                            ], width=4),
+                            dbc.Col([
+                                html.Label("Select Year", style={'fontWeight': '600', 'marginBottom': '5px'}),
+                                dcc.Slider(
+                                    id='productivity-year-slider',
+                                    min=MIN_YEAR,
+                                    max=MAX_YEAR,
+                                    value=MAX_YEAR,
+                                    marks={y: str(y) for y in range(MIN_YEAR, MAX_YEAR+1, 10)},
+                                    step=1,
+                                    tooltip={"placement": "bottom", "always_visible": True}
+                                ),
+                            ], width=4),
+                            dbc.Col([
+                                html.Label("Select Countries", style={'fontWeight': '600', 'marginBottom': '5px'}),
+                                dcc.Dropdown(
+                                    id='productivity-country-dropdown',
+                                    options=[{'label': c, 'value': c} for c in COUNTRIES],
+                                    value=['United States', 'China', 'India', 'Germany', 'Japan'] if all(c in COUNTRIES for c in ['United States', 'China', 'India', 'Germany', 'Japan']) else default_countries,
+                                    multi=True,
+                                    placeholder='Select countries...'
+                                ),
+                            ], width=4)
+                        ], style={'marginBottom': '20px'}),
+
+                        # Visualizations Grid
+                        dbc.Row([
+                            dbc.Col([
+                                dcc.Graph(id='productivity-gdp-scatter', config={'displayModeBar': False},
+                                         style={'height': '360px'})
+                            ], width=6),
+                            dbc.Col([
+                                dcc.Graph(id='productivity-timeseries', config={'displayModeBar': False},
+                                         style={'height': '360px'})
+                            ], width=6)
+                        ], className='mb-2'),
+
+                        dbc.Row([
+                            dbc.Col([
+                                dcc.Graph(id='productivity-growth-decomp', config={'displayModeBar': False},
+                                         style={'height': '360px'})
+                            ], width=6),
+                            dbc.Col([
+                                dcc.Graph(id='productivity-linearity-diagnostic', config={'displayModeBar': False},
+                                         style={'height': '360px'})
+                            ], width=6)
+                        ])
+                    ], style={'padding': '10px'})
+                ])
+            ], id="main-tabs", active_tab="tab-gdp")
+        ], width=12)
     ])
-], fluid=True, style={'paddingTop': '8px', 'paddingBottom': '20px'})
+], fluid=True, style={'paddingTop': '10px', 'paddingBottom': '10px'})
 
-# CALLBACK - INDICATOR DESCRIPTIONS
+# CALLBACKS
+
+# GDP TAB CALLBACK
 @app.callback(
-    Output('primary-indicator-desc', 'children'),
-    Output('comparison-indicator-desc', 'children'),
-    Input('primary-indicator', 'value'),
-    Input('comparison-indicator', 'value')
+    Output('gdp-world-map', 'figure'),
+    Output('gdp-distribution', 'figure'),
+    Output('gdp-scatter-log', 'figure'),
+    Output('gdp-timeseries', 'figure'),
+    Input('gdp-country-dropdown', 'value'),
+    Input('gdp-year-slider', 'value')
 )
-def update_indicator_descriptions(primary, comparison):
-    """Return human-readable descriptions for selected indicators."""
-    def make_desc(key):
-        if not key:
-            return ''
-        label = AVAILABLE_INDICATORS.get(key, key)
-        long = INDICATOR_DESCRIPTIONS.get(key)
-        if long:
-            return html.Div([html.Strong(f"{label}: "), html.Span(long)])
-        return html.Div(html.Span(label))
+def update_gdp_tab(selected_countries, selected_year):
+    """Update all GDP visualizations based on selected countries and year."""
+    if not selected_countries:
+        selected_countries = []
 
-    return make_desc(primary), make_desc(comparison)
+    # Filter data for selected year
+    year_data = df[df['year'] == selected_year].copy()
 
-# CALLBACK - UPDATE ALL CHARTS
+    # Use rgdpe (Real GDP - expenditure) as the main GDP indicator
+    gdp_col = 'rgdpe'
+
+    # 1. WORLD MAP
+    iso_col = None
+    for c in ['iso_a3', 'iso3', 'countrycode', 'country_code', 'countrycode3']:
+        if c in year_data.columns:
+            iso_col = c
+            break
+
+    if gdp_col in year_data.columns and not year_data[gdp_col].isna().all():
+        if iso_col is not None and year_data[iso_col].notna().any():
+            fig_map = px.choropleth(
+                year_data,
+                locations=iso_col,
+                color=gdp_col,
+                hover_name='country',
+                locationmode='ISO-3',
+                color_continuous_scale='Viridis',
+                labels={gdp_col: 'Real GDP (mil. 2021 USD)'},
+                title=f'Global GDP Distribution ({selected_year})'
+            )
+        else:
+            fig_map = px.choropleth(
+                year_data,
+                locations='country',
+                color=gdp_col,
+                hover_name='country',
+                color_continuous_scale='Viridis',
+                labels={gdp_col: 'Real GDP (mil. 2021 USD)'},
+                title=f'Global GDP Distribution ({selected_year})'
+            )
+
+        fig_map.update_layout(
+            **CHART_LAYOUT,
+            margin={'t': 40, 'b': 0, 'l': 0, 'r': 0},
+            coloraxis_colorbar={'title': 'GDP<br>(mil. USD)', 'thickness': 15, 'len': 0.7},
+            geo=dict(
+                showframe=True,
+                framecolor='#333',
+                framewidth=2,
+                showcoastlines=True,
+                coastlinecolor='#666',
+                projection_type='natural earth'
+            )
+        )
+    else:
+        fig_map = go.Figure()
+        fig_map.add_annotation(text='GDP data not available', xref='paper', yref='paper',
+                              x=0.5, y=0.5, showarrow=False)
+        fig_map.update_layout(**CHART_LAYOUT)
+
+    # 2. DISTRIBUTION GRAPH (LOG SCALE)
+    if gdp_col in year_data.columns:
+        gdp_values = year_data[gdp_col].dropna()
+        # Filter out zero or negative values for log scale
+        gdp_values = gdp_values[gdp_values > 0]
+
+        if len(gdp_values) > 0:
+            # Convert to log10
+            log_gdp_values = np.log10(gdp_values)
+
+            fig_dist = go.Figure()
+
+            # Histogram
+            fig_dist.add_trace(go.Histogram(
+                x=log_gdp_values,
+                name='Frequency',
+                marker=dict(color=COLORS[0], opacity=0.7, line=dict(width=1, color='white')),
+                nbinsx=40,
+                histnorm='probability density'
+            ))
+
+            # KDE
+            from scipy import stats as scipy_stats
+            if len(log_gdp_values) > 2:
+                kde = scipy_stats.gaussian_kde(log_gdp_values)
+                x_range = np.linspace(log_gdp_values.min(), log_gdp_values.max(), 200)
+                y_kde = kde(x_range)
+                fig_dist.add_trace(go.Scatter(
+                    x=x_range, y=y_kde, mode='lines', name='KDE',
+                    line=dict(color='#333', width=3)
+                ))
+
+            # Mark selected countries
+            if selected_countries:
+                for idx, country in enumerate(selected_countries):
+                    country_data = year_data[year_data['country'] == country]
+                    if not country_data.empty and pd.notna(country_data[gdp_col].iloc[0]):
+                        value = country_data[gdp_col].iloc[0]
+                        if value > 0:  # Only plot if positive
+                            log_value = np.log10(value)
+                            color_idx = idx % len(COLORS)
+                            fig_dist.add_vline(
+                                x=log_value,
+                                line_dash="dash",
+                                line_color=COLORS[color_idx],
+                                line_width=2,
+                                annotation_text=country[:15],
+                                annotation_position="top"
+                            )
+
+            fig_dist.update_layout(
+                **CHART_LAYOUT,
+                title=f'GDP Distribution - log₁₀ scale ({selected_year})',
+                xaxis_title='log₁₀(Real GDP)',
+                yaxis_title='Density',
+                showlegend=True,
+                bargap=0.05
+            )
+        else:
+            fig_dist = go.Figure()
+            fig_dist.add_annotation(text='No data available', xref='paper', yref='paper',
+                                   x=0.5, y=0.5, showarrow=False)
+            fig_dist.update_layout(**CHART_LAYOUT)
+    else:
+        fig_dist = go.Figure()
+        fig_dist.add_annotation(text='GDP data not available', xref='paper', yref='paper',
+                               x=0.5, y=0.5, showarrow=False)
+        fig_dist.update_layout(**CHART_LAYOUT)
+
+    # 3. SCATTERPLOT (LOG GDP) - Labeled
+    if gdp_col in year_data.columns:
+        scatter_data = year_data.dropna(subset=[gdp_col]).copy()
+        scatter_data['log_gdp'] = np.log10(scatter_data[gdp_col])
+        scatter_data['selected'] = scatter_data['country'].isin(selected_countries)
+
+        fig_scatter = go.Figure()
+
+        # Other countries (not selected)
+        other = scatter_data[~scatter_data['selected']]
+        if len(other) > 0:
+            fig_scatter.add_trace(go.Scatter(
+                x=other.index,
+                y=other['log_gdp'],
+                mode='markers',
+                name='Other countries',
+                text=other['country'],
+                marker=dict(size=8, color='rgba(200, 200, 200, 0.5)', line=dict(width=0.5, color='white')),
+                hovertemplate='<b>%{text}</b><br>log₁₀(GDP): %{y:.2f}<extra></extra>',
+                showlegend=True
+            ))
+
+        # Selected countries (labeled)
+        selected = scatter_data[scatter_data['selected']]
+        if len(selected) > 0:
+            for idx, (_, row) in enumerate(selected.iterrows()):
+                color_idx = idx % len(COLORS)
+                fig_scatter.add_trace(go.Scatter(
+                    x=[row.name],
+                    y=[row['log_gdp']],
+                    mode='markers+text',
+                    name=row['country'],
+                    text=[row['country']],
+                    textposition='top center',
+                    textfont=dict(size=10, color='#222'),
+                    marker=dict(size=12, color=COLORS[color_idx], line=dict(width=2, color='white')),
+                    hovertemplate=f'<b>{row["country"]}</b><br>log₁₀(GDP): {row["log_gdp"]:.2f}<extra></extra>',
+                    showlegend=True
+                ))
+
+        fig_scatter.update_layout(
+            **CHART_LAYOUT,
+            title=f'log₁₀(GDP) by Country ({selected_year})',
+            xaxis_title='Country Index',
+            yaxis_title='log₁₀(Real GDP)',
+            showlegend=True,
+            hovermode='closest'
+        )
+    else:
+        fig_scatter = go.Figure()
+        fig_scatter.add_annotation(text='GDP data not available', xref='paper', yref='paper',
+                                  x=0.5, y=0.5, showarrow=False)
+        fig_scatter.update_layout(**CHART_LAYOUT)
+
+    # 4. TIME SERIES for selected countries
+    if selected_countries and gdp_col in df.columns:
+        ts_data = df[df['country'].isin(selected_countries)].copy()
+
+        fig_ts = px.line(
+            ts_data,
+            x='year',
+            y=gdp_col,
+            color='country',
+            markers=True,
+            labels={gdp_col: 'Real GDP (mil. 2021 USD)', 'year': 'Year'},
+            title='GDP Over Time - Selected Countries',
+            color_discrete_sequence=COLORS
+        )
+
+        fig_ts.update_traces(line=dict(width=3), marker=dict(size=6))
+        fig_ts.update_layout(**CHART_LAYOUT)
+        fig_ts.update_yaxes(title='Real GDP (mil. 2021 USD)')
+
+        # Add vertical line for selected year
+        fig_ts.add_vline(
+            x=selected_year,
+            line_dash="dash",
+            line_color="red",
+            line_width=2,
+            annotation_text=f"Year: {selected_year}",
+            annotation_position="top"
+        )
+    else:
+        fig_ts = go.Figure()
+        if not selected_countries:
+            fig_ts.add_annotation(text='Please select countries to view time series',
+                                 xref='paper', yref='paper', x=0.5, y=0.5, showarrow=False)
+        else:
+            fig_ts.add_annotation(text='GDP data not available', xref='paper', yref='paper',
+                                 x=0.5, y=0.5, showarrow=False)
+        fig_ts.update_layout(**CHART_LAYOUT)
+
+    return fig_map, fig_dist, fig_scatter, fig_ts
+
+
+# CAPITAL TAB CALLBACK
+@app.callback(
+    Output('capital-gdp-scatter', 'figure'),
+    Output('capital-kl-ky-timeseries', 'figure'),
+    Output('capital-linearity-diagnostic', 'figure'),
+    Output('capital-residuals-plot', 'figure'),
+    Input('capital-year-slider', 'value'),
+    Input('capital-country-dropdown', 'value')
+)
+def update_capital_tab(selected_year, selected_countries):
+    """Update all Capital visualizations based on selected year and countries."""
+    if not selected_countries:
+        selected_countries = []
+
+    # Filter data for selected year
+    year_data = df[df['year'] == selected_year].copy()
+
+    # Compute axis ranges from full dataset for consistency
+    log10_rnna_range = [df['log10_rnna'].min(), df['log10_rnna'].max()]
+    log10_rgdpo_range = [df['log10_rgdpo'].min(), df['log10_rgdpo'].max()]
+
+    # =====================================================================
+    # FIGURE 1: Capital vs GDP (log-log scatter with OLS fit)
+    # =====================================================================
+    if 'log10_rnna' in year_data.columns and 'log10_rgdpo' in year_data.columns:
+        scatter_data = year_data.dropna(subset=['log10_rnna', 'log10_rgdpo', 'country']).copy()
+
+        fig1 = go.Figure()
+
+        if len(scatter_data) > 0:
+            # Size by population if available
+            if 'pop' in scatter_data.columns:
+                sizes = scatter_data['pop'].fillna(1)
+                sizes = (sizes / sizes.max()) * 30 + 5  # Scale to 5-35
+            else:
+                sizes = 10
+
+            # Plot all countries
+            fig1.add_trace(go.Scatter(
+                x=scatter_data['log10_rnna'],
+                y=scatter_data['log10_rgdpo'],
+                mode='markers',
+                name='Countries',
+                text=scatter_data['country'],
+                marker=dict(
+                    size=sizes,
+                    color=scatter_data.get('countrycode', scatter_data['country']).astype('category').cat.codes,
+                    colorscale='Viridis',
+                    opacity=0.7,
+                    line=dict(width=0.5, color='white')
+                ),
+                hovertemplate='<b>%{text}</b><br>log₁₀(Capital): %{x:.2f}<br>log₁₀(GDP): %{y:.2f}<extra></extra>',
+                showlegend=True
+            ))
+
+            # Add labels for top N countries by GDP
+            top_n = scatter_data.nlargest(10, 'rgdpo') if 'rgdpo' in scatter_data.columns else scatter_data.head(10)
+            for _, row in top_n.iterrows():
+                fig1.add_annotation(
+                    x=row['log10_rnna'],
+                    y=row['log10_rgdpo'],
+                    text=row['country'][:12],
+                    showarrow=False,
+                    font=dict(size=8, color='#333'),
+                    yshift=10
+                )
+
+            # OLS fit
+            if len(scatter_data) > 2:
+                X = scatter_data[['log10_rnna']].dropna()
+                y = scatter_data.loc[X.index, 'log10_rgdpo']
+                X_const = sm.add_constant(X)
+                model = sm.OLS(y, X_const).fit()
+
+                # Fitted line
+                x_fit = np.linspace(scatter_data['log10_rnna'].min(), scatter_data['log10_rnna'].max(), 100)
+                y_fit = model.params['const'] + model.params['log10_rnna'] * x_fit
+
+                fig1.add_trace(go.Scatter(
+                    x=x_fit,
+                    y=y_fit,
+                    mode='lines',
+                    name=f'OLS Fit (R²={model.rsquared:.3f})',
+                    line=dict(color='red', width=2, dash='dash'),
+                    hovertemplate='OLS Fit<extra></extra>'
+                ))
+
+            fig1.update_layout(
+                **CHART_LAYOUT,
+                title=f'Capital Stock vs Real GDP (log-log), Year: {selected_year}',
+                hovermode='closest'
+            )
+            fig1.update_xaxes(title='log₁₀(Capital Stock - rnna)', range=log10_rnna_range)
+            fig1.update_yaxes(title='log₁₀(Real GDP - rgdpo)', range=log10_rgdpo_range)
+            fig1.add_annotation(
+                text='Tests proportionality between capital and output',
+                xref='paper', yref='paper',
+                x=0.5, y=1.05,
+                xanchor='center', yanchor='bottom',
+                showarrow=False,
+                font=dict(size=10, color='#666')
+            )
+        else:
+            fig1.add_annotation(text='Insufficient data', xref='paper', yref='paper',
+                               x=0.5, y=0.5, showarrow=False)
+            fig1.update_layout(**CHART_LAYOUT)
+    else:
+        fig1 = go.Figure()
+        fig1.add_annotation(text='Capital/GDP data not available', xref='paper', yref='paper',
+                           x=0.5, y=0.5, showarrow=False)
+        fig1.update_layout(**CHART_LAYOUT)
+
+    # =====================================================================
+    # FIGURE 2: K/L and K/Y time series
+    # =====================================================================
+    if selected_countries and 'kl' in df.columns and 'ky' in df.columns:
+        ts_data = df[df['country'].isin(selected_countries)].copy()
+
+        fig2 = go.Figure()
+
+        # K/L traces
+        for idx, country in enumerate(selected_countries):
+            country_data = ts_data[ts_data['country'] == country]
+            if not country_data.empty:
+                color_idx = idx % len(COLORS)
+                # K/L
+                fig2.add_trace(go.Scatter(
+                    x=country_data['year'],
+                    y=country_data['kl'],
+                    mode='lines+markers',
+                    name=f'{country} - K/L',
+                    line=dict(color=COLORS[color_idx], width=2),
+                    marker=dict(size=4),
+                    hovertemplate=f'<b>{country}</b><br>Year: %{{x}}<br>K/L: %{{y:.2f}}<extra></extra>'
+                ))
+
+        fig2.update_layout(
+            **CHART_LAYOUT,
+            title='Capital Intensity (K/L) and Capital-Output Ratio (K/Y)',
+            xaxis_title='Year',
+            yaxis_title='K/L (Capital per Worker)',
+            hovermode='x unified',
+            showlegend=True
+        )
+
+        # Add button to toggle between K/L and K/Y
+        fig2.update_layout(
+            updatemenus=[
+                dict(
+                    type="buttons",
+                    direction="left",
+                    buttons=[
+                        dict(
+                            label="K/L",
+                            method="update",
+                            args=[{"visible": [True] * len(selected_countries) + [False] * len(selected_countries)},
+                                  {"yaxis": {"title": "K/L (Capital per Worker)"}}]
+                        ),
+                        dict(
+                            label="K/Y",
+                            method="update",
+                            args=[{"visible": [False] * len(selected_countries) + [True] * len(selected_countries)},
+                                  {"yaxis": {"title": "K/Y (Capital-Output Ratio)"}}]
+                        )
+                    ],
+                    pad={"r": 10, "t": 10},
+                    showactive=True,
+                    x=0.0,
+                    xanchor="left",
+                    y=1.15,
+                    yanchor="top"
+                )
+            ]
+        )
+
+        # Add K/Y traces (initially hidden)
+        for idx, country in enumerate(selected_countries):
+            country_data = ts_data[ts_data['country'] == country]
+            if not country_data.empty:
+                color_idx = idx % len(COLORS)
+                fig2.add_trace(go.Scatter(
+                    x=country_data['year'],
+                    y=country_data['ky'],
+                    mode='lines+markers',
+                    name=f'{country} - K/Y',
+                    line=dict(color=COLORS[color_idx], width=2, dash='dot'),
+                    marker=dict(size=4),
+                    visible=False,
+                    hovertemplate=f'<b>{country}</b><br>Year: %{{x}}<br>K/Y: %{{y:.2f}}<extra></extra>'
+                ))
+    else:
+        fig2 = go.Figure()
+        if not selected_countries:
+            fig2.add_annotation(text='Please select countries', xref='paper', yref='paper',
+                               x=0.5, y=0.5, showarrow=False)
+        else:
+            fig2.add_annotation(text='K/L or K/Y data not available', xref='paper', yref='paper',
+                               x=0.5, y=0.5, showarrow=False)
+        fig2.update_layout(**CHART_LAYOUT)
+
+    # =====================================================================
+    # FIGURE 3: Linearity Diagnostic with LOWESS
+    # =====================================================================
+    if 'log10_rnna' in year_data.columns and 'log10_rgdpo' in year_data.columns:
+        diag_data = year_data.dropna(subset=['log10_rnna', 'log10_rgdpo']).copy()
+
+        fig3 = go.Figure()
+
+        if len(diag_data) > 3:
+            # Model 1: Linear
+            X = diag_data[['log10_rnna']]
+            y = diag_data['log10_rgdpo']
+            X_const = sm.add_constant(X)
+            model1 = sm.OLS(y, X_const).fit()
+
+            # Model 2: Quadratic
+            diag_data['log10_rnna_sq'] = diag_data['log10_rnna'] ** 2
+            X2 = diag_data[['log10_rnna', 'log10_rnna_sq']]
+            X2_const = sm.add_constant(X2)
+            model2 = sm.OLS(y, X2_const).fit()
+
+            # Print diagnostics to console
+            print(f"\n=== CAPITAL LINEARITY DIAGNOSTICS (Year {selected_year}) ===")
+            print(f"Linear Model R²: {model1.rsquared:.4f}")
+            print(f"Linear Model Slope: {model1.params['log10_rnna']:.4f}")
+            print(f"Quadratic Model R²: {model2.rsquared:.4f}")
+            print(f"Squared Term p-value: {model2.pvalues['log10_rnna_sq']:.4f}")
+            print("=" * 60)
+
+            # Scatter points
+            fig3.add_trace(go.Scatter(
+                x=diag_data['log10_rnna'],
+                y=diag_data['log10_rgdpo'],
+                mode='markers',
+                name='Data',
+                marker=dict(size=6, color='rgba(100, 100, 200, 0.5)', line=dict(width=0.5, color='white')),
+                hovertemplate='log₁₀(Capital): %{x:.2f}<br>log₁₀(GDP): %{y:.2f}<extra></extra>'
+            ))
+
+            # OLS line
+            x_fit = np.linspace(diag_data['log10_rnna'].min(), diag_data['log10_rnna'].max(), 100)
+            y_fit = model1.params['const'] + model1.params['log10_rnna'] * x_fit
+            fig3.add_trace(go.Scatter(
+                x=x_fit,
+                y=y_fit,
+                mode='lines',
+                name='Linear Fit',
+                line=dict(color='red', width=2, dash='dash'),
+                hovertemplate='Linear Fit<extra></extra>'
+            ))
+
+            # LOWESS curve
+            if len(diag_data) > 10:
+                lowess_result = lowess(diag_data['log10_rgdpo'], diag_data['log10_rnna'], frac=0.3)
+                fig3.add_trace(go.Scatter(
+                    x=lowess_result[:, 0],
+                    y=lowess_result[:, 1],
+                    mode='lines',
+                    name='LOWESS',
+                    line=dict(color='green', width=2),
+                    hovertemplate='LOWESS<extra></extra>'
+                ))
+
+            fig3.update_layout(
+                **CHART_LAYOUT,
+                title=f'Linearity Check: log₁₀(rgdpo) vs log₁₀(rnna), Year {selected_year}',
+                xaxis_title='log₁₀(Capital Stock - rnna)',
+                yaxis_title='log₁₀(Real GDP - rgdpo)',
+                hovermode='closest',
+                showlegend=True
+            )
+
+            # Annotation with diagnostics
+            annotation_text = (
+                f"<b>Linear Model</b><br>"
+                f"R²: {model1.rsquared:.3f}<br>"
+                f"Slope: {model1.params['log10_rnna']:.3f}<br>"
+                f"<b>Quadratic Model</b><br>"
+                f"R²: {model2.rsquared:.3f}<br>"
+                f"p(x²): {model2.pvalues['log10_rnna_sq']:.4f}"
+            )
+            fig3.add_annotation(
+                text=annotation_text,
+                xref='paper', yref='paper',
+                x=0.02, y=0.98,
+                xanchor='left', yanchor='top',
+                showarrow=False,
+                bgcolor='rgba(255, 255, 255, 0.9)',
+                bordercolor='#999',
+                borderwidth=1,
+                borderpad=6,
+                font=dict(size=9)
+            )
+        else:
+            fig3.add_annotation(text='Insufficient data for diagnostics', xref='paper', yref='paper',
+                               x=0.5, y=0.5, showarrow=False)
+            fig3.update_layout(**CHART_LAYOUT)
+    else:
+        fig3 = go.Figure()
+        fig3.add_annotation(text='Data not available', xref='paper', yref='paper',
+                           x=0.5, y=0.5, showarrow=False)
+        fig3.update_layout(**CHART_LAYOUT)
+
+    # =====================================================================
+    # FIGURE 4: Residuals vs Fitted
+    # =====================================================================
+    if 'log10_rnna' in year_data.columns and 'log10_rgdpo' in year_data.columns:
+        resid_data = year_data.dropna(subset=['log10_rnna', 'log10_rgdpo']).copy()
+
+        fig4 = go.Figure()
+
+        if len(resid_data) > 2:
+            # Fit linear model
+            X = resid_data[['log10_rnna']]
+            y = resid_data['log10_rgdpo']
+            X_const = sm.add_constant(X)
+            model = sm.OLS(y, X_const).fit()
+
+            # Compute fitted values and residuals
+            fitted = model.fittedvalues
+            residuals = model.resid
+
+            # Scatter plot
+            fig4.add_trace(go.Scatter(
+                x=fitted,
+                y=residuals,
+                mode='markers',
+                name='Residuals',
+                marker=dict(size=6, color='rgba(150, 100, 150, 0.5)', line=dict(width=0.5, color='white')),
+                hovertemplate='Fitted: %{x:.2f}<br>Residual: %{y:.2f}<extra></extra>'
+            ))
+
+            # Zero line
+            fig4.add_hline(y=0, line_dash="solid", line_color="#666", line_width=2)
+
+            # Add LOWESS trend to residuals
+            if len(fitted) > 10:
+                lowess_resid = lowess(residuals, fitted, frac=0.3)
+                fig4.add_trace(go.Scatter(
+                    x=lowess_resid[:, 0],
+                    y=lowess_resid[:, 1],
+                    mode='lines',
+                    name='Trend',
+                    line=dict(color='red', width=2),
+                    hovertemplate='Trend<extra></extra>'
+                ))
+
+            fig4.update_layout(
+                **CHART_LAYOUT,
+                title=f'Residuals vs Fitted (Linear Model), Year {selected_year}',
+                xaxis_title='Fitted Values',
+                yaxis_title='Residuals',
+                hovermode='closest',
+                showlegend=True
+            )
+        else:
+            fig4.add_annotation(text='Insufficient data', xref='paper', yref='paper',
+                               x=0.5, y=0.5, showarrow=False)
+            fig4.update_layout(**CHART_LAYOUT)
+    else:
+        fig4 = go.Figure()
+        fig4.add_annotation(text='Data not available', xref='paper', yref='paper',
+                           x=0.5, y=0.5, showarrow=False)
+        fig4.update_layout(**CHART_LAYOUT)
+
+    return fig1, fig2, fig3, fig4
+
+
+# LABOUR TAB CALLBACK
+@app.callback(
+    Output('labour-gdp-scatter', 'figure'),
+    Output('labour-timeseries', 'figure'),
+    Output('labour-linearity-diagnostic', 'figure'),
+    Output('labour-residuals-plot', 'figure'),
+    Input('labour-indicator-dropdown', 'value'),
+    Input('labour-year-slider', 'value'),
+    Input('labour-country-dropdown', 'value')
+)
+def update_labour_tab(selected_indicator, selected_year, selected_countries):
+    """Update all Labour visualizations based on selected indicator, year, and countries."""
+
+    if not selected_countries:
+        selected_countries = []
+
+    # Indicator mapping for labels
+    indicator_labels = {
+        'emp': 'Employment (millions)',
+        'hc': 'Human Capital Index',
+        'labsh': 'Labour Share',
+        'labprod': 'Labour Productivity (GDP/Worker)'
+    }
+
+    indicator_label = indicator_labels.get(selected_indicator, selected_indicator)
+    log_indicator = f'log10_{selected_indicator}'
+
+    # Filter data for selected year
+    year_data = df[df['year'] == selected_year].copy()
+
+    # Check if required columns exist
+    if selected_indicator not in df.columns or log_indicator not in df.columns or 'log10_rgdpo' not in df.columns:
+        empty_fig = go.Figure()
+        empty_fig.add_annotation(text=f'Data not available for {indicator_label}',
+                                xref='paper', yref='paper', x=0.5, y=0.5, showarrow=False)
+        empty_fig.update_layout(**CHART_LAYOUT)
+        return empty_fig, empty_fig, empty_fig, empty_fig
+
+    # =====================================================================
+    # FIGURE 1: GDP vs Selected Labour Indicator (log-log scatter)
+    # =====================================================================
+    scatter_data = year_data.dropna(subset=[log_indicator, 'log10_rgdpo', 'country']).copy()
+
+    fig1 = go.Figure()
+
+    if len(scatter_data) > 2:
+        # Size by population if available
+        if 'pop' in scatter_data.columns:
+            sizes = scatter_data['pop'].fillna(1)
+            sizes = (sizes / sizes.max()) * 30 + 5  # Scale to 5-35
+        else:
+            sizes = 10
+
+        # Scatter plot
+        fig1.add_trace(go.Scatter(
+            x=scatter_data[log_indicator],
+            y=scatter_data['log10_rgdpo'],
+            mode='markers',
+            name='Countries',
+            text=scatter_data['country'],
+            marker=dict(
+                size=sizes,
+                color=scatter_data.get('countrycode', scatter_data['country']).astype('category').cat.codes,
+                colorscale='Plasma',
+                opacity=0.7,
+                line=dict(width=0.5, color='white')
+            ),
+            hovertemplate=(
+                '<b>%{text}</b><br>' +
+                f'{indicator_label}: %{{customdata[0]:.2f}}<br>' +
+                'GDP: %{customdata[1]:.2f}<br>' +
+                'Population: %{customdata[2]:.1f}M<extra></extra>'
+            ),
+            customdata=np.column_stack([
+                scatter_data[selected_indicator],
+                scatter_data['rgdpo'],
+                scatter_data.get('pop', np.zeros(len(scatter_data)))
+            ])
+        ))
+
+        # OLS fit
+        X = scatter_data[[log_indicator]].dropna()
+        y = scatter_data.loc[X.index, 'log10_rgdpo']
+        X_const = sm.add_constant(X)
+        model_linear = sm.OLS(y, X_const).fit()
+
+        # Quadratic model for non-linearity test
+        scatter_data['log_indicator_sq'] = scatter_data[log_indicator] ** 2
+        X2 = scatter_data[[log_indicator, 'log_indicator_sq']].dropna()
+        y2 = scatter_data.loc[X2.index, 'log10_rgdpo']
+        X2_const = sm.add_constant(X2)
+        model_quad = sm.OLS(y2, X2_const).fit()
+
+        # Print diagnostics
+        print(f"\n=== LABOUR ANALYSIS DIAGNOSTICS ===")
+        print(f"Year {selected_year}, Indicator={indicator_label}:")
+        print(f"  R²={model_linear.rsquared:.3f}")
+        print(f"  slope={model_linear.params[log_indicator]:.3f}")
+        print(f"  p²-term={model_quad.pvalues['log_indicator_sq']:.4f}")
+        print("=" * 60)
+
+        # Fitted line
+        x_fit = np.linspace(scatter_data[log_indicator].min(), scatter_data[log_indicator].max(), 100)
+        y_fit = model_linear.params['const'] + model_linear.params[log_indicator] * x_fit
+
+        fig1.add_trace(go.Scatter(
+            x=x_fit,
+            y=y_fit,
+            mode='lines',
+            name=f'OLS (R²={model_linear.rsquared:.3f})',
+            line=dict(color='red', width=2, dash='dash'),
+            hovertemplate='OLS Fit<extra></extra>'
+        ))
+
+        # LOWESS curve
+        if len(scatter_data) > 10:
+            lowess_result = lowess(scatter_data['log10_rgdpo'], scatter_data[log_indicator], frac=0.3)
+            fig1.add_trace(go.Scatter(
+                x=lowess_result[:, 0],
+                y=lowess_result[:, 1],
+                mode='lines',
+                name='LOWESS',
+                line=dict(color='green', width=2),
+                hovertemplate='LOWESS<extra></extra>'
+            ))
+
+        fig1.update_layout(
+            **CHART_LAYOUT,
+            title=f'GDP vs {indicator_label}, Year {selected_year}',
+            hovermode='closest',
+            showlegend=True
+        )
+        fig1.update_xaxes(title=f'log₁₀({indicator_label})')
+        fig1.update_yaxes(title='log₁₀(Real GDP)')
+    else:
+        fig1.add_annotation(text='Insufficient data', xref='paper', yref='paper',
+                           x=0.5, y=0.5, showarrow=False)
+        fig1.update_layout(**CHART_LAYOUT)
+
+    # =====================================================================
+    # FIGURE 2: Linearity Diagnostic
+    # =====================================================================
+    diag_data = year_data.dropna(subset=[log_indicator, 'log10_rgdpo']).copy()
+
+    fig2 = go.Figure()
+
+    if len(diag_data) > 3:
+        # Scatter points
+        fig2.add_trace(go.Scatter(
+            x=diag_data[log_indicator],
+            y=diag_data['log10_rgdpo'],
+            mode='markers',
+            name='Data',
+            marker=dict(size=6, color='rgba(100, 150, 200, 0.5)', line=dict(width=0.5, color='white')),
+            hovertemplate=f'log₁₀({indicator_label}): %{{x:.2f}}<br>log₁₀(GDP): %{{y:.2f}}<extra></extra>'
+        ))
+
+        # Recompute models for this figure
+        X = diag_data[[log_indicator]].dropna()
+        y = diag_data.loc[X.index, 'log10_rgdpo']
+        X_const = sm.add_constant(X)
+        model = sm.OLS(y, X_const).fit()
+
+        # Quadratic
+        diag_data['log_indicator_sq'] = diag_data[log_indicator] ** 2
+        X2 = diag_data[[log_indicator, 'log_indicator_sq']].dropna()
+        y2 = diag_data.loc[X2.index, 'log10_rgdpo']
+        X2_const = sm.add_constant(X2)
+        model2 = sm.OLS(y2, X2_const).fit()
+
+        # OLS line
+        x_fit = np.linspace(diag_data[log_indicator].min(), diag_data[log_indicator].max(), 100)
+        y_fit = model.params['const'] + model.params[log_indicator] * x_fit
+
+        fig2.add_trace(go.Scatter(
+            x=x_fit,
+            y=y_fit,
+            mode='lines',
+            name='OLS Fit',
+            line=dict(color='red', width=2, dash='dash'),
+            hovertemplate='OLS Fit<extra></extra>'
+        ))
+
+        # LOWESS
+        if len(diag_data) > 10:
+            lowess_result = lowess(diag_data['log10_rgdpo'], diag_data[log_indicator], frac=0.3)
+            fig2.add_trace(go.Scatter(
+                x=lowess_result[:, 0],
+                y=lowess_result[:, 1],
+                mode='lines',
+                name='LOWESS',
+                line=dict(color='green', width=2),
+                hovertemplate='LOWESS<extra></extra>'
+            ))
+
+        fig2.update_layout(
+            **CHART_LAYOUT,
+            title=f'Linearity Check: GDP vs {indicator_label}, Year {selected_year}',
+            hovermode='closest',
+            showlegend=True
+        )
+        fig2.update_xaxes(title=f'log₁₀({indicator_label})')
+        fig2.update_yaxes(title='log₁₀(Real GDP)')
+
+        # Annotation with diagnostics
+        annotation_text = (
+            f"<b>Diagnostics</b><br>"
+            f"R²: {model.rsquared:.3f}<br>"
+            f"Slope: {model.params[log_indicator]:.3f}<br>"
+            f"p(x²): {model2.pvalues['log_indicator_sq']:.4f}"
+        )
+        fig2.add_annotation(
+            text=annotation_text,
+            xref='paper', yref='paper',
+            x=0.02, y=0.98,
+            xanchor='left', yanchor='top',
+            showarrow=False,
+            bgcolor='rgba(255, 255, 255, 0.9)',
+            bordercolor='#999',
+            borderwidth=1,
+            borderpad=6,
+            font=dict(size=9)
+        )
+    else:
+        fig2.add_annotation(text='Insufficient data', xref='paper', yref='paper',
+                           x=0.5, y=0.5, showarrow=False)
+        fig2.update_layout(**CHART_LAYOUT)
+
+    # =====================================================================
+    # FIGURE 3: Residuals vs Fitted
+    # =====================================================================
+    resid_data = year_data.dropna(subset=[log_indicator, 'log10_rgdpo']).copy()
+
+    fig3 = go.Figure()
+
+    if len(resid_data) > 2:
+        # Fit model
+        X = resid_data[[log_indicator]].dropna()
+        y = resid_data.loc[X.index, 'log10_rgdpo']
+        X_const = sm.add_constant(X)
+        model = sm.OLS(y, X_const).fit()
+
+        # Compute residuals
+        fitted = model.fittedvalues
+        residuals = model.resid
+
+        # Scatter
+        fig3.add_trace(go.Scatter(
+            x=fitted,
+            y=residuals,
+            mode='markers',
+            name='Residuals',
+            marker=dict(size=6, color='rgba(150, 100, 150, 0.5)', line=dict(width=0.5, color='white')),
+            hovertemplate='Fitted: %{x:.2f}<br>Residual: %{y:.2f}<extra></extra>'
+        ))
+
+        # Zero line
+        fig3.add_hline(y=0, line_dash="solid", line_color="#666", line_width=2)
+
+        # LOWESS trend
+        if len(fitted) > 10:
+            lowess_resid = lowess(residuals, fitted, frac=0.3)
+            fig3.add_trace(go.Scatter(
+                x=lowess_resid[:, 0],
+                y=lowess_resid[:, 1],
+                mode='lines',
+                name='Trend',
+                line=dict(color='red', width=2),
+                hovertemplate='Trend<extra></extra>'
+            ))
+
+        fig3.update_layout(
+            **CHART_LAYOUT,
+            title=f'Residuals vs Fitted ({indicator_label}), Year {selected_year}',
+            xaxis_title='Fitted Values',
+            yaxis_title='Residuals',
+            hovermode='closest',
+            showlegend=True
+        )
+    else:
+        fig3.add_annotation(text='Insufficient data', xref='paper', yref='paper',
+                           x=0.5, y=0.5, showarrow=False)
+        fig3.update_layout(**CHART_LAYOUT)
+
+    # =====================================================================
+    # FIGURE 4: Time Series Trends
+    # =====================================================================
+    fig4 = go.Figure()
+
+    if selected_countries and selected_indicator in df.columns:
+        ts_data = df[df['country'].isin(selected_countries)].copy()
+
+        if len(ts_data) > 0:
+            for idx, country in enumerate(selected_countries):
+                country_data = ts_data[ts_data['country'] == country].sort_values('year')
+                if not country_data.empty:
+                    color_idx = idx % len(COLORS)
+                    fig4.add_trace(go.Scatter(
+                        x=country_data['year'],
+                        y=country_data[selected_indicator],
+                        mode='lines+markers',
+                        name=country,
+                        line=dict(color=COLORS[color_idx], width=2),
+                        marker=dict(size=4),
+                        hovertemplate=f'<b>{country}</b><br>Year: %{{x}}<br>{indicator_label}: %{{y:.2f}}<extra></extra>'
+                    ))
+
+            # Add vertical line for selected year
+            fig4.add_vline(
+                x=selected_year,
+                line_dash="dash",
+                line_color="gray",
+                line_width=2,
+                annotation_text=f"Year: {selected_year}",
+                annotation_position="top"
+            )
+
+            fig4.update_layout(
+                **CHART_LAYOUT,
+                title=f'Evolution of {indicator_label} over Time',
+                xaxis_title='Year',
+                yaxis_title=indicator_label,
+                hovermode='x unified',
+                showlegend=True
+            )
+        else:
+            fig4.add_annotation(text='No data for selected countries', xref='paper', yref='paper',
+                               x=0.5, y=0.5, showarrow=False)
+            fig4.update_layout(**CHART_LAYOUT)
+    else:
+        if not selected_countries:
+            fig4.add_annotation(text='Please select countries to view time series', xref='paper', yref='paper',
+                               x=0.5, y=0.5, showarrow=False)
+        else:
+            fig4.add_annotation(text='Data not available', xref='paper', yref='paper',
+                               x=0.5, y=0.5, showarrow=False)
+        fig4.update_layout(**CHART_LAYOUT)
+
+    return fig1, fig4, fig2, fig3
+
+
+# PRODUCTIVITY TAB CALLBACK
+@app.callback(
+    Output('productivity-gdp-scatter', 'figure'),
+    Output('productivity-timeseries', 'figure'),
+    Output('productivity-growth-decomp', 'figure'),
+    Output('productivity-linearity-diagnostic', 'figure'),
+    Input('productivity-indicator-dropdown', 'value'),
+    Input('productivity-year-slider', 'value'),
+    Input('productivity-country-dropdown', 'value')
+)
+def update_productivity_tab(selected_indicator, selected_year, selected_countries):
+    """Update all Productivity visualizations based on selected indicator, year, and countries."""
+
+    if not selected_countries:
+        selected_countries = []
+
+    # Indicator mapping for labels
+    indicator_labels = {
+        'labprod': 'Labour Productivity (GDP/Worker)',
+        'capprod': 'Capital Productivity (GDP/Capital)',
+        'tfp': 'Total Factor Productivity'
+    }
+
+    indicator_label = indicator_labels.get(selected_indicator, selected_indicator)
+    log_indicator = f'log10_{selected_indicator}'
+
+    # Filter data for selected year
+    year_data = df[df['year'] == selected_year].copy()
+
+    # Check if required columns exist
+    if selected_indicator not in df.columns or log_indicator not in df.columns or 'log10_rgdpo' not in df.columns:
+        empty_fig = go.Figure()
+        empty_fig.add_annotation(text=f'Data not available for {indicator_label}',
+                                xref='paper', yref='paper', x=0.5, y=0.5, showarrow=False)
+        empty_fig.update_layout(**CHART_LAYOUT)
+        return empty_fig, empty_fig, empty_fig, empty_fig
+
+    # =====================================================================
+    # FIGURE 1: GDP vs Selected Productivity (log-log scatter)
+    # =====================================================================
+    scatter_data = year_data.dropna(subset=[log_indicator, 'log10_rgdpo', 'country']).copy()
+
+    fig1 = go.Figure()
+
+    if len(scatter_data) > 2:
+        # Size by population if available
+        if 'pop' in scatter_data.columns:
+            sizes = scatter_data['pop'].fillna(1)
+            sizes = (sizes / sizes.max()) * 30 + 5  # Scale to 5-35
+        else:
+            sizes = 10
+
+        # Scatter plot
+        fig1.add_trace(go.Scatter(
+            x=scatter_data[log_indicator],
+            y=scatter_data['log10_rgdpo'],
+            mode='markers',
+            name='Countries',
+            text=scatter_data['country'],
+            marker=dict(
+                size=sizes,
+                color=scatter_data.get('countrycode', scatter_data['country']).astype('category').cat.codes,
+                colorscale='Turbo',
+                opacity=0.7,
+                line=dict(width=0.5, color='white')
+            ),
+            hovertemplate=(
+                '<b>%{text}</b><br>' +
+                f'{indicator_label}: %{{customdata[0]:.4f}}<br>' +
+                'GDP: %{customdata[1]:.2f}<br>' +
+                'Population: %{customdata[2]:.1f}M<extra></extra>'
+            ),
+            customdata=np.column_stack([
+                scatter_data[selected_indicator],
+                scatter_data['rgdpo'],
+                scatter_data.get('pop', np.zeros(len(scatter_data)))
+            ])
+        ))
+
+        # OLS fit
+        X = scatter_data[[log_indicator]].dropna()
+        y = scatter_data.loc[X.index, 'log10_rgdpo']
+        X_const = sm.add_constant(X)
+        model_linear = sm.OLS(y, X_const).fit()
+
+        # Quadratic model for non-linearity test
+        scatter_data['log_indicator_sq'] = scatter_data[log_indicator] ** 2
+        X2 = scatter_data[[log_indicator, 'log_indicator_sq']].dropna()
+        y2 = scatter_data.loc[X2.index, 'log10_rgdpo']
+        X2_const = sm.add_constant(X2)
+        model_quad = sm.OLS(y2, X2_const).fit()
+
+        # Print diagnostics
+        print(f"\n=== PRODUCTIVITY ANALYSIS DIAGNOSTICS ===")
+        print(f"Year {selected_year}, Indicator={indicator_label}:")
+        print(f"  R²={model_linear.rsquared:.3f}")
+        print(f"  slope={model_linear.params[log_indicator]:.3f}")
+        print(f"  p²-term={model_quad.pvalues['log_indicator_sq']:.4f}")
+        print("=" * 60)
+
+        # Fitted line
+        x_fit = np.linspace(scatter_data[log_indicator].min(), scatter_data[log_indicator].max(), 100)
+        y_fit = model_linear.params['const'] + model_linear.params[log_indicator] * x_fit
+
+        fig1.add_trace(go.Scatter(
+            x=x_fit,
+            y=y_fit,
+            mode='lines',
+            name=f'OLS (R²={model_linear.rsquared:.3f})',
+            line=dict(color='red', width=2, dash='dash'),
+            hovertemplate='OLS Fit<extra></extra>'
+        ))
+
+        # LOWESS curve
+        if len(scatter_data) > 10:
+            lowess_result = lowess(scatter_data['log10_rgdpo'], scatter_data[log_indicator], frac=0.3)
+            fig1.add_trace(go.Scatter(
+                x=lowess_result[:, 0],
+                y=lowess_result[:, 1],
+                mode='lines',
+                name='LOWESS',
+                line=dict(color='green', width=2),
+                hovertemplate='LOWESS<extra></extra>'
+            ))
+
+        fig1.update_layout(
+            **CHART_LAYOUT,
+            title=f'GDP vs {indicator_label}, Year {selected_year}',
+            hovermode='closest',
+            showlegend=True
+        )
+        fig1.update_xaxes(title=f'log₁₀({indicator_label})')
+        fig1.update_yaxes(title='log₁₀(Real GDP)')
+    else:
+        fig1.add_annotation(text='Insufficient data', xref='paper', yref='paper',
+                           x=0.5, y=0.5, showarrow=False)
+        fig1.update_layout(**CHART_LAYOUT)
+
+    # =====================================================================
+    # FIGURE 2: Time Series Trends
+    # =====================================================================
+    fig2 = go.Figure()
+
+    if selected_countries and selected_indicator in df.columns:
+        ts_data = df[df['country'].isin(selected_countries)].copy()
+
+        if len(ts_data) > 0:
+            for idx, country in enumerate(selected_countries):
+                country_data = ts_data[ts_data['country'] == country].sort_values('year')
+                if not country_data.empty:
+                    color_idx = idx % len(COLORS)
+                    fig2.add_trace(go.Scatter(
+                        x=country_data['year'],
+                        y=country_data[selected_indicator],
+                        mode='lines+markers',
+                        name=country,
+                        line=dict(color=COLORS[color_idx], width=2),
+                        marker=dict(size=4),
+                        hovertemplate=f'<b>{country}</b><br>Year: %{{x}}<br>{indicator_label}: %{{y:.4f}}<extra></extra>'
+                    ))
+
+            # Add vertical line for selected year
+            fig2.add_vline(
+                x=selected_year,
+                line_dash="dash",
+                line_color="gray",
+                line_width=2,
+                annotation_text=f"Year: {selected_year}",
+                annotation_position="top"
+            )
+
+            fig2.update_layout(
+                **CHART_LAYOUT,
+                title=f'Evolution of {indicator_label} over Time',
+                xaxis_title='Year',
+                yaxis_title=indicator_label,
+                hovermode='x unified',
+                showlegend=True
+            )
+        else:
+            fig2.add_annotation(text='No data for selected countries', xref='paper', yref='paper',
+                               x=0.5, y=0.5, showarrow=False)
+            fig2.update_layout(**CHART_LAYOUT)
+    else:
+        if not selected_countries:
+            fig2.add_annotation(text='Please select countries to view time series', xref='paper', yref='paper',
+                               x=0.5, y=0.5, showarrow=False)
+        else:
+            fig2.add_annotation(text='Data not available', xref='paper', yref='paper',
+                               x=0.5, y=0.5, showarrow=False)
+        fig2.update_layout(**CHART_LAYOUT)
+
+    # =====================================================================
+    # FIGURE 3: GDP Growth Decomposition
+    # =====================================================================
+    fig3 = go.Figure()
+
+    if selected_countries and 'gdp_growth' in df.columns:
+        # For simplicity, show growth decomposition for the first selected country
+        if len(selected_countries) > 0:
+            target_country = selected_countries[0]
+            decomp_data = df[df['country'] == target_country].copy()
+            decomp_data = decomp_data.sort_values('year')
+
+            # Approximate Cobb-Douglas: g_Y ≈ α*g_K + (1-α)*g_L + g_TFP
+            # where α = capital share = 1 - labsh
+            if all(col in decomp_data.columns for col in ['gdp_growth', 'tfp_growth', 'labsh']):
+                decomp_data = decomp_data.dropna(subset=['gdp_growth', 'tfp_growth', 'labsh'])
+
+                if len(decomp_data) > 1:
+                    # Compute contributions (simplified)
+                    # TFP contribution
+                    tfp_contrib = decomp_data['tfp_growth'].fillna(0)
+
+                    # For visualization purposes, show TFP, Labour, and Capital contributions
+                    # This is a simplified decomposition
+                    years = decomp_data['year']
+
+                    fig3.add_trace(go.Scatter(
+                        x=years,
+                        y=tfp_contrib,
+                        mode='lines',
+                        name='TFP Contribution',
+                        stackgroup='one',
+                        line=dict(width=0.5, color=COLORS[0]),
+                        fillcolor=COLORS[0],
+                        hovertemplate='<b>TFP</b><br>Year: %{x}<br>Contribution: %{y:.2f}%<extra></extra>'
+                    ))
+
+                    # Labour contribution (approximation)
+                    if 'labprod_growth' in decomp_data.columns:
+                        labour_contrib = decomp_data['gdp_growth'] - tfp_contrib
+                        labour_contrib = labour_contrib.fillna(0).clip(lower=-20, upper=20)  # Clip extremes
+
+                        fig3.add_trace(go.Scatter(
+                            x=years,
+                            y=labour_contrib,
+                            mode='lines',
+                            name='Other Factors',
+                            stackgroup='one',
+                            line=dict(width=0.5, color=COLORS[1]),
+                            fillcolor=COLORS[1],
+                            hovertemplate='<b>Other</b><br>Year: %{x}<br>Contribution: %{y:.2f}%<extra></extra>'
+                        ))
+
+                    # Add GDP growth line for reference
+                    fig3.add_trace(go.Scatter(
+                        x=years,
+                        y=decomp_data['gdp_growth'],
+                        mode='lines+markers',
+                        name='Total GDP Growth',
+                        line=dict(color='black', width=2, dash='dot'),
+                        marker=dict(size=4),
+                        hovertemplate='<b>GDP Growth</b><br>Year: %{x}<br>Growth: %{y:.2f}%<extra></extra>'
+                    ))
+
+                    fig3.update_layout(
+                        **CHART_LAYOUT,
+                        title=f'GDP Growth Decomposition — {target_country}',
+                        xaxis_title='Year',
+                        yaxis_title='Contribution to Growth (%)',
+                        hovermode='x unified',
+                        showlegend=True
+                    )
+                else:
+                    fig3.add_annotation(text='Insufficient data for decomposition', xref='paper', yref='paper',
+                                       x=0.5, y=0.5, showarrow=False)
+                    fig3.update_layout(**CHART_LAYOUT)
+            else:
+                fig3.add_annotation(text='Required variables not available', xref='paper', yref='paper',
+                                   x=0.5, y=0.5, showarrow=False)
+                fig3.update_layout(**CHART_LAYOUT)
+        else:
+            fig3.add_annotation(text='Please select a country', xref='paper', yref='paper',
+                               x=0.5, y=0.5, showarrow=False)
+            fig3.update_layout(**CHART_LAYOUT)
+    else:
+        fig3.add_annotation(text='Please select countries', xref='paper', yref='paper',
+                           x=0.5, y=0.5, showarrow=False)
+        fig3.update_layout(**CHART_LAYOUT)
+
+    # =====================================================================
+    # FIGURE 4: Linearity Diagnostic (GDP vs TFP)
+    # =====================================================================
+    fig4 = go.Figure()
+
+    if 'log10_tfp' in year_data.columns and 'log10_rgdpo' in year_data.columns:
+        diag_data = year_data.dropna(subset=['log10_tfp', 'log10_rgdpo']).copy()
+
+        if len(diag_data) > 3:
+            # Scatter points
+            fig4.add_trace(go.Scatter(
+                x=diag_data['log10_tfp'],
+                y=diag_data['log10_rgdpo'],
+                mode='markers',
+                name='Data',
+                text=diag_data['country'],
+                marker=dict(size=6, color='rgba(100, 100, 200, 0.5)', line=dict(width=0.5, color='white')),
+                hovertemplate='<b>%{text}</b><br>log₁₀(TFP): %{x:.2f}<br>log₁₀(GDP): %{y:.2f}<extra></extra>'
+            ))
+
+            # OLS model
+            X = diag_data[['log10_tfp']].dropna()
+            y = diag_data.loc[X.index, 'log10_rgdpo']
+            X_const = sm.add_constant(X)
+            model = sm.OLS(y, X_const).fit()
+
+            # Quadratic
+            diag_data['log_tfp_sq'] = diag_data['log10_tfp'] ** 2
+            X2 = diag_data[['log10_tfp', 'log_tfp_sq']].dropna()
+            y2 = diag_data.loc[X2.index, 'log10_rgdpo']
+            X2_const = sm.add_constant(X2)
+            model2 = sm.OLS(y2, X2_const).fit()
+
+            # OLS line
+            x_fit = np.linspace(diag_data['log10_tfp'].min(), diag_data['log10_tfp'].max(), 100)
+            y_fit = model.params['const'] + model.params['log10_tfp'] * x_fit
+
+            fig4.add_trace(go.Scatter(
+                x=x_fit,
+                y=y_fit,
+                mode='lines',
+                name='OLS Fit',
+                line=dict(color='red', width=2, dash='dash'),
+                hovertemplate='OLS Fit<extra></extra>'
+            ))
+
+            # LOWESS
+            if len(diag_data) > 10:
+                lowess_result = lowess(diag_data['log10_rgdpo'], diag_data['log10_tfp'], frac=0.3)
+                fig4.add_trace(go.Scatter(
+                    x=lowess_result[:, 0],
+                    y=lowess_result[:, 1],
+                    mode='lines',
+                    name='LOWESS',
+                    line=dict(color='green', width=2),
+                    hovertemplate='LOWESS<extra></extra>'
+                ))
+
+            fig4.update_layout(
+                **CHART_LAYOUT,
+                title='Linearity Check: GDP vs TFP',
+                hovermode='closest',
+                showlegend=True
+            )
+            fig4.update_xaxes(title='log₁₀(Total Factor Productivity)')
+            fig4.update_yaxes(title='log₁₀(Real GDP)')
+
+            # Annotation with diagnostics
+            annotation_text = (
+                f"<b>Diagnostics (Year {selected_year})</b><br>"
+                f"R²: {model.rsquared:.3f}<br>"
+                f"Slope: {model.params['log10_tfp']:.3f}<br>"
+                f"p(x²): {model2.pvalues['log_tfp_sq']:.4f}"
+            )
+            fig4.add_annotation(
+                text=annotation_text,
+                xref='paper', yref='paper',
+                x=0.02, y=0.98,
+                xanchor='left', yanchor='top',
+                showarrow=False,
+                bgcolor='rgba(255, 255, 255, 0.9)',
+                bordercolor='#999',
+                borderwidth=1,
+                borderpad=6,
+                font=dict(size=9)
+            )
+        else:
+            fig4.add_annotation(text='Insufficient data', xref='paper', yref='paper',
+                               x=0.5, y=0.5, showarrow=False)
+            fig4.update_layout(**CHART_LAYOUT)
+    else:
+        fig4.add_annotation(text='TFP data not available', xref='paper', yref='paper',
+                           x=0.5, y=0.5, showarrow=False)
+        fig4.update_layout(**CHART_LAYOUT)
+
+    return fig1, fig2, fig3, fig4
+
+
+# OLD CALLBACKS COMMENTED OUT - Components removed during restructure
+# The old chart update callback code has been removed.
+# Reference the git history if you need to restore any of the visualization logic.
+
+"""
+# CALLBACK - UPDATE ALL CHARTS (DEPRECATED)
 @app.callback(
     Output('gdp-world-map', 'figure'),
     Output('gdp-timeseries', 'figure'),
@@ -323,7 +1820,7 @@ def update_indicator_descriptions(primary, comparison):
     Input('scatter-show-labels', 'value'),
     Input('dist-log-scale', 'value')
 )
-def update(country_list, year_range, log_opt, primary_indicator, comparison_indicator, clickData,
+def update_old(country_list, year_range, log_opt, primary_indicator, comparison_indicator, clickData,
            scatter_log_x, scatter_log_y, scatter_show_labels, dist_log_scale):
     if not country_list:
         country_list = [COUNTRIES[0]]
@@ -821,7 +2318,7 @@ def update(country_list, year_range, log_opt, primary_indicator, comparison_indi
         data_table = html.P("No data to display", style={'color': '#999', 'padding': '20px'})
 
     return fig_map, fig_gdp, fig_growth, fig_rel, fig_scatter, fig_residual, fig_dist, fig_qq, data_table, stats_content, selected_info
-
+"""
 
 if __name__ == '__main__':
     app.run(debug=True, port=8000)
